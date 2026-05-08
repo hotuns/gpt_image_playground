@@ -64,6 +64,28 @@ describe('URL settings params', () => {
     expect(next.activeProfileId).toBe(existingProfile.id)
   })
 
+  it('reuses a matching legacy URL profile even when chat model differs', () => {
+    const existingProfile = createDefaultOpenAIProfile({
+      id: 'existing-openai',
+      name: 'Existing OpenAI',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'test-key',
+      chatModel: 'custom-chat-model',
+    })
+    const current = normalizeSettings({
+      ...DEFAULT_SETTINGS,
+      profiles: [createDefaultOpenAIProfile(), existingProfile],
+      activeProfileId: DEFAULT_SETTINGS.activeProfileId,
+    })
+    const next = normalizeSettings({
+      ...current,
+      ...buildSettingsFromUrlParams(current, new URLSearchParams('apiUrl=https://api.example.com/v1&apiKey=test-key')),
+    })
+
+    expect(next.profiles).toHaveLength(2)
+    expect(next.activeProfileId).toBe(existingProfile.id)
+  })
+
   it('creates an OpenAI profile from legacy params even when fal is active', () => {
     const falProfile = createDefaultFalProfile({ id: 'fal-active', apiKey: 'fal-key' })
     const current = normalizeSettings({

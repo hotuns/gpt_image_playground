@@ -170,7 +170,7 @@ export default function DetailModal() {
   const taskProviderName = taskProvider === 'fal' ? 'fal.ai' : taskProvider ? 'OpenAI' : '未知'
   const taskProfileName = task.apiProfileName || '未知'
   const taskModel = task.apiModel || '未知'
-  const showSourceInfo = Boolean(task.apiProvider || task.apiProfileName || task.apiModel)
+  const showSourceInfo = Boolean(task.apiProvider || task.apiProfileName || task.apiModel || task.origin === 'chat-tool')
   const isFalReconnecting = task.status === 'error' && task.falRecoverable
   const isCustomReconnecting = task.status === 'error' && task.customRecoverable
 
@@ -550,7 +550,7 @@ export default function DetailModal() {
               <div className="mb-2 rounded-lg bg-gray-50 px-3 py-2 text-xs dark:bg-white/[0.03]">
                 <span className="text-gray-400 dark:text-gray-500">来源</span>
                 <br />
-                <span className="font-medium text-gray-700 dark:text-gray-200">{taskProviderName}</span>
+                <span className="font-medium text-gray-700 dark:text-gray-200">{task.origin === 'chat-tool' ? 'Chat 工具' : taskProviderName}</span>
                 <span className="text-gray-400 dark:text-gray-500"> · {taskProfileName} · {taskModel}</span>
               </div>
             )}

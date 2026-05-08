@@ -3,6 +3,8 @@ import { persist } from 'zustand/middleware'
 import type {
   ApiProfile,
   AppSettings,
+  ChatMessage,
+  ChatSession,
   TaskParams,
   InputImage,
   MaskDraft,
@@ -13,9 +15,17 @@ import { DEFAULT_PARAMS } from './types'
 import { DEFAULT_SETTINGS, getActiveApiProfile, getCustomProviderDefinition, mergeImportedSettings, normalizeSettings, validateApiProfile } from './lib/apiProfiles'
 import {
   CURRENT_THUMBNAIL_VERSION,
+  deleteChatMessage,
+  deleteChatSession as dbDeleteChatSession,
   getAllTasks,
+  getAllChatMessages,
+  getAllChatSessions,
   putTask,
+  putChatMessage,
+  putChatSession,
   deleteTask as dbDeleteTask,
+  clearChatMessages,
+  clearChatSessions,
   clearTasks as dbClearTasks,
   getImage,
   getImageThumbnail,
@@ -30,6 +40,7 @@ import {
 } from './lib/db'
 import { callImageApi } from './lib/api'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
+import { type GenerateImageToolArgs, streamOpenAICompatibleChat } from './lib/openaiCompatibleChatApi'
 import { getCustomQueuedImageResult } from './lib/openaiCompatibleImageApi'
 import { validateMaskMatchesImage } from './lib/canvasImage'
 import { orderInputImagesForMask } from './lib/mask'
@@ -53,10 +64,100 @@ const CUSTOM_RECOVERY_POLL_MS = 10_000
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const chatAbortControllers = new Map<string, AbortController>()
+const chatMessagePersistTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
+const CHAT_INTERRUPTED_ERROR = '响应中断'
+const CHAT_MESSAGE_PERSIST_THROTTLE_MS = 200
 
 function createOpenAITimeoutError(timeoutSeconds: number) {
   return `请求超时：超过 ${timeoutSeconds} 秒仍未完成，请稍后重试或提高超时时间。`
+}
+
+function createChatInterruptedError() {
+  return CHAT_INTERRUPTED_ERROR
+}
+
+function clearChatAbortController(sessionId: string) {
+  chatAbortControllers.delete(sessionId)
+}
+
+function clearChatMessagePersistTimer(messageId: string) {
+  const timer = chatMessagePersistTimers.get(messageId)
+  if (timer) clearTimeout(timer)
+  chatMessagePersistTimers.delete(messageId)
+}
+
+function scheduleChatMessagePersist(message: ChatMessage) {
+  clearChatMessagePersistTimer(message.id)
+  const timer = setTimeout(() => {
+    chatMessagePersistTimers.delete(message.id)
+    void putChatMessage(message)
+  }, CHAT_MESSAGE_PERSIST_THROTTLE_MS)
+  chatMessagePersistTimers.set(message.id, timer)
+}
+
+async function flushChatMessagePersist(message: ChatMessage) {
+  clearChatMessagePersistTimer(message.id)
+  await putChatMessage(message)
+}
+
+function sortChatSessions(sessions: ChatSession[]) {
+  return [...sessions].sort((a, b) => b.lastMessageAt - a.lastMessageAt || b.updatedAt - a.updatedAt)
+}
+
+function sortChatMessages(messages: ChatMessage[]) {
+  return [...messages].sort((a, b) => a.createdAt - b.createdAt || a.updatedAt - b.updatedAt)
+}
+
+function buildChatSessionTitle(text: string) {
+  const normalized = text.trim().replace(/\s+/g, ' ')
+  return normalized.slice(0, 24) || '新对话'
+}
+
+function getSessionMessages(messages: ChatMessage[], sessionId: string) {
+  return sortChatMessages(messages.filter((message) => message.sessionId === sessionId))
+}
+
+function collectReferencedImageIds(tasks: TaskRecord[], inputImages: InputImage[], chatMessages: ChatMessage[]) {
+  const referencedIds = new Set<string>()
+  for (const img of inputImages) referencedIds.add(img.id)
+  for (const t of tasks) {
+    for (const id of t.inputImageIds || []) referencedIds.add(id)
+    if (t.maskImageId) referencedIds.add(t.maskImageId)
+    for (const id of t.outputImages || []) referencedIds.add(id)
+  }
+  for (const message of chatMessages) {
+    for (const id of message.relatedImageIds || []) referencedIds.add(id)
+  }
+  return referencedIds
+}
+
+function markInterruptedChatState(
+  sessions: ChatSession[],
+  messages: ChatMessage[],
+  now = Date.now(),
+) {
+  const interruptedSessionIds = new Set<string>()
+  const interruptedMessageIds = new Set<string>()
+  const updatedMessages = messages.map((message) => {
+    if (message.status !== 'streaming') return message
+    interruptedSessionIds.add(message.sessionId)
+    interruptedMessageIds.add(message.id)
+    return {
+      ...message,
+      kind: message.role === 'tool' ? 'text' as const : message.kind,
+      status: 'error' as const,
+      text: message.role === 'tool'
+        ? '图片生成已中断'
+        : (message.text || createChatInterruptedError()),
+      updatedAt: now,
+    }
+  })
+  const updatedSessions = sessions.map((session) => interruptedSessionIds.has(session.id)
+    ? { ...session, status: 'error' as const, updatedAt: now, lastMessageAt: now }
+    : session)
+  return { sessions: updatedSessions, messages: updatedMessages, interruptedSessionIds, interruptedMessageIds }
 }
 
 export function getCachedImage(id: string): string | undefined {
@@ -324,6 +425,14 @@ interface AppState {
   tasks: TaskRecord[]
   setTasks: (t: TaskRecord[]) => void
 
+  // Chat
+  chatSessions: ChatSession[]
+  setChatSessions: (sessions: ChatSession[]) => void
+  chatMessages: ChatMessage[]
+  setChatMessages: (messages: ChatMessage[]) => void
+  activeChatSessionId: string | null
+  setActiveChatSessionId: (id: string | null) => void
+
   // 搜索和筛选
   searchQuery: string
   setSearchQuery: (q: string) => void
@@ -490,6 +599,14 @@ export const useStore = create<AppState>()(
       tasks: [],
       setTasks: (tasks) => set({ tasks }),
 
+      // Chat
+      chatSessions: [],
+      setChatSessions: (chatSessions) => set({ chatSessions: sortChatSessions(chatSessions) }),
+      chatMessages: [],
+      setChatMessages: (chatMessages) => set({ chatMessages: sortChatMessages(chatMessages) }),
+      activeChatSessionId: null,
+      setActiveChatSessionId: (activeChatSessionId) => set({ activeChatSessionId }),
+
       // Search & Filter
       searchQuery: '',
       setSearchQuery: (searchQuery) => set({ searchQuery }),
@@ -547,6 +664,50 @@ export const useStore = create<AppState>()(
 )
 
 // ===== Actions =====
+
+function upsertChatSessionInStore(session: ChatSession) {
+  const { chatSessions, setChatSessions } = useStore.getState()
+  const hasExisting = chatSessions.some((item) => item.id === session.id)
+  setChatSessions(hasExisting ? chatSessions.map((item) => item.id === session.id ? session : item) : [session, ...chatSessions])
+  void putChatSession(session)
+}
+
+function upsertChatMessageInStore(message: ChatMessage, persistMode: 'immediate' | 'throttle' = 'immediate') {
+  const { chatMessages, setChatMessages } = useStore.getState()
+  const hasExisting = chatMessages.some((item) => item.id === message.id)
+  setChatMessages(hasExisting ? chatMessages.map((item) => item.id === message.id ? message : item) : [...chatMessages, message])
+  if (persistMode === 'throttle') {
+    scheduleChatMessagePersist(message)
+  } else {
+    void flushChatMessagePersist(message)
+  }
+}
+
+function removeChatMessageFromStore(messageId: string) {
+  const { chatMessages, setChatMessages } = useStore.getState()
+  setChatMessages(chatMessages.filter((message) => message.id !== messageId))
+  clearChatMessagePersistTimer(messageId)
+  void deleteChatMessage(messageId)
+}
+
+function updateChatMessageInStore(
+  messageId: string,
+  patch: Partial<ChatMessage> | ((message: ChatMessage) => ChatMessage),
+  persistMode: 'immediate' | 'throttle' = 'immediate',
+) {
+  const { chatMessages } = useStore.getState()
+  const current = chatMessages.find((message) => message.id === messageId)
+  if (!current) return
+  const updated = typeof patch === 'function' ? patch(current) : { ...current, ...patch }
+  upsertChatMessageInStore(updated, persistMode)
+}
+
+function updateChatSessionInStore(sessionId: string, patch: Partial<ChatSession>) {
+  const { chatSessions } = useStore.getState()
+  const current = chatSessions.find((session) => session.id === sessionId)
+  if (!current) return
+  upsertChatSessionInStore({ ...current, ...patch })
+}
 
 let uid = 0
 function genId(): string {
@@ -884,10 +1045,28 @@ async function recoverFalTask(taskId: string) {
 
 /** 初始化：从 IndexedDB 加载任务，按需恢复输入图片，并清理孤立图片 */
 export async function initStore() {
-  const storedTasks = await getAllTasks()
+  const [storedTasks, storedChatSessions, storedChatMessages] = await Promise.all([
+    getAllTasks(),
+    getAllChatSessions(),
+    getAllChatMessages(),
+  ])
   const { tasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks)
   await Promise.all(interruptedTasks.map((task) => putTask(task)))
   useStore.getState().setTasks(tasks)
+  const interruptedChatState = markInterruptedChatState(storedChatSessions, storedChatMessages)
+  useStore.getState().setChatSessions(interruptedChatState.sessions)
+  useStore.getState().setChatMessages(interruptedChatState.messages)
+  await Promise.all([
+    ...interruptedChatState.sessions
+      .filter((session) => interruptedChatState.interruptedSessionIds.has(session.id))
+      .map((session) => putChatSession(session)),
+    ...interruptedChatState.messages
+      .filter((message) => interruptedChatState.interruptedMessageIds.has(message.id))
+      .map((message) => putChatMessage(message)),
+  ])
+  if (!useStore.getState().activeChatSessionId && interruptedChatState.sessions[0]) {
+    useStore.getState().setActiveChatSessionId(interruptedChatState.sessions[0].id)
+  }
   for (const task of tasks) {
     if (
       task.apiProvider === 'fal' &&
@@ -906,16 +1085,8 @@ export async function initStore() {
   }
 
   // 收集所有任务引用的图片 id
-  const referencedIds = new Set<string>()
   const persistedInputImages = useStore.getState().inputImages
-  for (const img of persistedInputImages) referencedIds.add(img.id)
-  for (const t of tasks) {
-    for (const id of t.inputImageIds || []) referencedIds.add(id)
-    if (t.maskImageId) referencedIds.add(t.maskImageId)
-    for (const id of t.outputImages || []) {
-      referencedIds.add(id)
-    }
-  }
+  const referencedIds = collectReferencedImageIds(tasks, persistedInputImages, interruptedChatState.messages)
 
   // 只枚举 key 清理孤立图片，避免启动时把所有 4K 原图读进内存。
   const imageIds = await getAllImageIds()
@@ -945,6 +1116,62 @@ export async function initStore() {
   if (restoredInputImages.length !== persistedInputImages.length || restoredInputImages.some((img, index) => img.dataUrl !== persistedInputImages[index]?.dataUrl)) {
     useStore.getState().setInputImages(restoredInputImages)
   }
+}
+
+interface ExecuteTaskBehavior {
+  showSuccessToast?: boolean
+  openDetailOnError?: boolean
+}
+
+interface CreateImageTaskOptions extends ExecuteTaskBehavior {
+  prompt: string
+  params: TaskParams
+  activeProfile: ApiProfile
+  inputImageIds?: string[]
+  maskTargetImageId?: string | null
+  maskImageId?: string | null
+  origin?: TaskRecord['origin']
+  chatSessionId?: string
+  chatMessageId?: string
+}
+
+function createImageTaskRecord(options: CreateImageTaskOptions): TaskRecord {
+  return {
+    id: genId(),
+    prompt: options.prompt.trim(),
+    params: options.params,
+    origin: options.origin ?? 'manual',
+    chatSessionId: options.chatSessionId,
+    chatMessageId: options.chatMessageId,
+    apiProvider: options.activeProfile.provider,
+    apiProfileId: options.activeProfile.id,
+    apiProfileName: options.activeProfile.name,
+    apiModel: options.activeProfile.model,
+    inputImageIds: options.inputImageIds ? [...options.inputImageIds] : [],
+    maskTargetImageId: options.maskTargetImageId ?? null,
+    maskImageId: options.maskImageId ?? null,
+    outputImages: [],
+    status: 'running',
+    error: null,
+    createdAt: Date.now(),
+    finishedAt: null,
+    elapsed: null,
+  }
+}
+
+async function enqueueImageTask(task: TaskRecord) {
+  const latestTasks = useStore.getState().tasks
+  useStore.getState().setTasks([task, ...latestTasks])
+  await putTask(task)
+}
+
+async function createAndExecuteImageTask(options: CreateImageTaskOptions): Promise<TaskRecord | null> {
+  const task = createImageTaskRecord(options)
+  await enqueueImageTask(task)
+  return executeTask(task.id, {
+    showSuccessToast: options.showSuccessToast,
+    openDetailOnError: options.openDetailOnError,
+  })
 }
 
 /** 提交新任务 */
@@ -1032,30 +1259,6 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     useStore.getState().setParams(normalizedParamPatch)
   }
 
-  const taskId = genId()
-  const task: TaskRecord = {
-    id: taskId,
-    prompt: prompt.trim(),
-    params: normalizedParams,
-    apiProvider: activeProfile.provider,
-    apiProfileId: activeProfile.id,
-    apiProfileName: activeProfile.name,
-    apiModel: activeProfile.model,
-    inputImageIds: orderedInputImages.map((i) => i.id),
-    maskTargetImageId,
-    maskImageId,
-    outputImages: [],
-    status: 'running',
-    error: null,
-    createdAt: Date.now(),
-    finishedAt: null,
-    elapsed: null,
-  }
-
-  const latestTasks = useStore.getState().tasks
-  useStore.getState().setTasks([task, ...latestTasks])
-  await putTask(task)
-
   if (settings.clearInputAfterSubmit) {
     useStore.getState().setPrompt('')
     useStore.getState().clearInputImages()
@@ -1063,13 +1266,25 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
   useStore.getState().setReusedTaskApiProfile(null)
 
   // 异步调用 API
-  executeTask(taskId)
+  void createAndExecuteImageTask({
+    prompt: prompt.trim(),
+    params: normalizedParams,
+    activeProfile,
+    inputImageIds: orderedInputImages.map((image) => image.id),
+    maskTargetImageId,
+    maskImageId,
+    origin: 'manual',
+    showSuccessToast: true,
+    openDetailOnError: true,
+  })
 }
 
-async function executeTask(taskId: string) {
+async function executeTask(taskId: string, behavior: ExecuteTaskBehavior = {}) {
+  const showSuccessToast = behavior.showSuccessToast !== false
+  const openDetailOnError = behavior.openDetailOnError !== false
   const { settings } = useStore.getState()
   const task = useStore.getState().tasks.find((t) => t.id === taskId)
-  if (!task) return
+  if (!task) return null
   const taskProfile = getTaskApiProfile(settings, task)
   if (!taskProfile && task.apiProfileId) {
     updateTaskInStore(taskId, {
@@ -1080,7 +1295,7 @@ async function executeTask(taskId: string) {
       finishedAt: Date.now(),
       elapsed: Date.now() - task.createdAt,
     })
-    return
+    return useStore.getState().tasks.find((item) => item.id === taskId) ?? null
   }
   const activeProfile = taskProfile ?? getActiveApiProfile(settings)
   const requestSettings = createSettingsForApiProfile(settings, activeProfile)
@@ -1134,7 +1349,7 @@ async function executeTask(taskId: string) {
     })
 
     const latestBeforeSuccess = useStore.getState().tasks.find((t) => t.id === taskId)
-    if (!latestBeforeSuccess || latestBeforeSuccess.status !== 'running') return
+    if (!latestBeforeSuccess || latestBeforeSuccess.status !== 'running') return latestBeforeSuccess ?? null
 
     // 存储输出图片
     const outputIds: string[] = []
@@ -1175,7 +1390,7 @@ async function executeTask(taskId: string) {
 
     // 更新任务
     const latestBeforeUpdate = useStore.getState().tasks.find((t) => t.id === taskId)
-    if (!latestBeforeUpdate || latestBeforeUpdate.status !== 'running') return
+    if (!latestBeforeUpdate || latestBeforeUpdate.status !== 'running') return latestBeforeUpdate ?? null
     clearOpenAIWatchdogTimer(taskId)
     updateTaskInStore(taskId, {
       outputImages: outputIds,
@@ -1189,7 +1404,9 @@ async function executeTask(taskId: string) {
       customRecoverable: false,
     })
 
-    useStore.getState().showToast(`生成完成，共 ${outputIds.length} 张图片`, 'success')
+    if (showSuccessToast) {
+      useStore.getState().showToast(`生成完成，共 ${outputIds.length} 张图片`, 'success')
+    }
     const currentMask = useStore.getState().maskDraft
     if (
       maskDataUrl &&
@@ -1199,10 +1416,11 @@ async function executeTask(taskId: string) {
     ) {
       useStore.getState().clearMaskDraft()
     }
+    return useStore.getState().tasks.find((item) => item.id === taskId) ?? null
   } catch (err) {
     clearOpenAIWatchdogTimer(taskId)
     const latestTask = useStore.getState().tasks.find((t) => t.id === taskId) ?? task
-    if (latestTask.status !== 'running') return
+    if (latestTask.status !== 'running') return latestTask
     const latestFalRequestInfo = falRequestInfo ?? (latestTask.falRequestId && latestTask.falEndpoint
       ? { requestId: latestTask.falRequestId, endpoint: latestTask.falEndpoint }
       : null)
@@ -1237,8 +1455,11 @@ async function executeTask(taskId: string) {
         finishedAt: Date.now(),
         elapsed: Date.now() - task.createdAt,
       })
-      useStore.getState().setDetailTaskId(taskId)
+      if (openDetailOnError) {
+        useStore.getState().setDetailTaskId(taskId)
+      }
     }
+    return useStore.getState().tasks.find((item) => item.id === taskId) ?? null
   } finally {
     // 释放输入图片的内存缓存（已持久化到 IndexedDB，后续按需从 DB 加载）
     for (const imgId of task.inputImageIds) {
@@ -1262,31 +1483,347 @@ export async function retryTask(task: TaskRecord) {
   const { settings } = useStore.getState()
   const activeProfile = getActiveApiProfile(settings)
   const normalizedParams = normalizeParamsForSettings(task.params, settings, { hasInputImages: task.inputImageIds.length > 0 })
-  const taskId = genId()
-  const newTask: TaskRecord = {
-    id: taskId,
+  await createAndExecuteImageTask({
     prompt: task.prompt,
     params: normalizedParams,
-    apiProvider: activeProfile.provider,
-    apiProfileId: activeProfile.id,
-    apiProfileName: activeProfile.name,
-    apiModel: activeProfile.model,
+    activeProfile,
     inputImageIds: [...task.inputImageIds],
     maskTargetImageId: task.maskTargetImageId ?? null,
     maskImageId: task.maskImageId ?? null,
-    outputImages: [],
-    status: 'running',
-    error: null,
-    createdAt: Date.now(),
-    finishedAt: null,
-    elapsed: null,
+    origin: task.origin ?? 'manual',
+    chatSessionId: task.chatSessionId,
+    chatMessageId: task.chatMessageId,
+    showSuccessToast: true,
+    openDetailOnError: true,
+  })
+}
+
+function validateChatProfile(profile: ApiProfile): string | null {
+  if (profile.provider !== 'openai') return '当前 API 配置不支持 Chat，请切换到 OpenAI 配置。'
+  if (!profile.baseUrl.trim()) return '缺少 API URL'
+  if (!profile.apiKey.trim()) return '缺少 API Key'
+  if (!profile.chatModel.trim()) return '缺少 Chat 模型 ID'
+  return null
+}
+
+function getChatSessionApiProfile(settings: AppSettings, session: ChatSession): ApiProfile | null {
+  const normalized = normalizeSettings(settings)
+  const profile = normalized.profiles.find((item) => item.id === session.apiProfileId)
+  if (profile?.provider === 'openai') return profile
+  const active = getActiveApiProfile(normalized)
+  return active.provider === 'openai' ? active : null
+}
+
+function createChatSessionRecord(activeProfile: ApiProfile): ChatSession {
+  const now = Date.now()
+  return {
+    id: genId(),
+    title: '新对话',
+    apiProfileId: activeProfile.id,
+    status: 'idle',
+    createdAt: now,
+    updatedAt: now,
+    lastMessageAt: now,
+  }
+}
+
+function createChatMessageRecord(
+  sessionId: string,
+  role: ChatMessage['role'],
+  kind: ChatMessage['kind'],
+  text: string,
+  status: ChatMessage['status'] = 'done',
+): ChatMessage {
+  const now = Date.now()
+  return {
+    id: genId(),
+    sessionId,
+    role,
+    kind,
+    text,
+    status,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function updateChatSessionForNewMessage(session: ChatSession, message: ChatMessage, nextStatus = session.status): ChatSession {
+  return {
+    ...session,
+    status: nextStatus,
+    title: session.title === '新对话' && message.role === 'user' ? buildChatSessionTitle(message.text) : session.title,
+    updatedAt: message.updatedAt,
+    lastMessageAt: message.createdAt,
+  }
+}
+
+function summarizeTaskParams(params: Partial<TaskParams> | undefined) {
+  if (!params) return '默认参数'
+  const entries = Object.entries(params).filter(([, value]) => value !== undefined && value !== null)
+  if (!entries.length) return '默认参数'
+  return entries.map(([key, value]) => `${key}: ${String(value)}`).join(', ')
+}
+
+function getChatToolTaskParams(args: GenerateImageToolArgs, settings: AppSettings, profile: ApiProfile): TaskParams {
+  const baseParams = useStore.getState().params
+  const merged: TaskParams = {
+    ...baseParams,
+    size: args.size ?? baseParams.size,
+    quality: args.quality ?? baseParams.quality,
+    output_format: args.output_format ?? baseParams.output_format,
+    output_compression: args.output_compression !== undefined ? args.output_compression : baseParams.output_compression,
+    moderation: args.moderation ?? baseParams.moderation,
+    n: args.n ?? baseParams.n,
+  }
+  return normalizeParamsForSettings(merged, createSettingsForApiProfile(settings, profile), { hasInputImages: false })
+}
+
+async function executeGenerateImageTool(
+  session: ChatSession,
+  toolCall: { message: ChatMessage; resultMessage: ChatMessage; args: GenerateImageToolArgs },
+): Promise<void> {
+  const state = useStore.getState()
+  const profile = getChatSessionApiProfile(state.settings, session)
+  if (!profile) {
+    const now = Date.now()
+    updateChatMessageInStore(toolCall.resultMessage.id, {
+      kind: 'text',
+      text: '图片生成失败：找不到该会话使用的 OpenAI 配置。',
+      status: 'error',
+      updatedAt: now,
+      toolName: 'generate_image',
+      relatedImageIds: undefined,
+    }, 'immediate')
+    updateChatSessionInStore(session.id, { status: 'error', updatedAt: now, lastMessageAt: now })
+    return
   }
 
-  const latestTasks = useStore.getState().tasks
-  useStore.getState().setTasks([newTask, ...latestTasks])
-  await putTask(newTask)
+  const params = getChatToolTaskParams(toolCall.args, normalizeSettings(state.settings), profile)
+  const task = await createAndExecuteImageTask({
+    prompt: toolCall.args.prompt,
+    params,
+    activeProfile: profile,
+    origin: 'chat-tool',
+    chatSessionId: session.id,
+    chatMessageId: toolCall.resultMessage.id,
+    showSuccessToast: false,
+    openDetailOnError: false,
+  })
+  const latestTask = task ?? useStore.getState().tasks.find((item) => item.chatMessageId === toolCall.resultMessage.id) ?? null
+  const now = Date.now()
 
-  executeTask(taskId)
+  if (latestTask?.status === 'done') {
+    updateChatMessageInStore(toolCall.resultMessage.id, {
+      text: `任务 ${latestTask.id} 已生成 ${latestTask.outputImages.length} 张图片。参数：${summarizeTaskParams(latestTask.actualParams ?? latestTask.params)}`,
+      status: 'done',
+      updatedAt: now,
+      toolName: 'generate_image',
+      relatedTaskId: latestTask.id,
+      relatedImageIds: [...latestTask.outputImages],
+    }, 'immediate')
+    updateChatSessionInStore(session.id, { status: 'idle', updatedAt: now, lastMessageAt: now })
+    return
+  }
+
+  updateChatMessageInStore(toolCall.resultMessage.id, {
+    kind: 'text',
+    text: `generate_image 执行失败。${latestTask?.id ? `任务 ${latestTask.id}。` : ''}错误：${latestTask?.error ?? '未知错误'}`,
+    status: 'error',
+    updatedAt: now,
+    toolName: 'generate_image',
+    relatedTaskId: latestTask?.id,
+    relatedImageIds: undefined,
+  }, 'immediate')
+  updateChatSessionInStore(session.id, { status: 'error', updatedAt: now, lastMessageAt: now })
+}
+
+async function runChatAssistantLoop(sessionId: string) {
+  const MAX_TOOL_ITERATIONS = 3
+
+  for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+    const state = useStore.getState()
+    const session = state.chatSessions.find((item) => item.id === sessionId)
+    if (!session) return
+    const profile = getChatSessionApiProfile(state.settings, session)
+    if (!profile) {
+      state.showToast('当前会话对应的 OpenAI 配置已不存在', 'error')
+      updateChatSessionInStore(sessionId, { status: 'error', updatedAt: Date.now(), lastMessageAt: Date.now() })
+      return
+    }
+
+    const assistantMessage = createChatMessageRecord(sessionId, 'assistant', 'text', '', 'streaming')
+    upsertChatMessageInStore(assistantMessage, 'immediate')
+    upsertChatSessionInStore({
+      ...session,
+      status: 'streaming',
+      updatedAt: assistantMessage.updatedAt,
+      lastMessageAt: assistantMessage.createdAt,
+    })
+
+    const controller = new AbortController()
+    let timedOut = false
+    const timeoutId = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, Math.max(1, profile.timeout) * 1000)
+    chatAbortControllers.set(sessionId, controller)
+
+    try {
+      const result = await streamOpenAICompatibleChat({
+        profile,
+        messages: getSessionMessages(useStore.getState().chatMessages, sessionId),
+        signal: controller.signal,
+        onTextDelta: (delta) => {
+          updateChatMessageInStore(assistantMessage.id, (message) => ({
+            ...message,
+            text: message.text + delta,
+            updatedAt: Date.now(),
+          }), 'throttle')
+        },
+      })
+      clearChatAbortController(sessionId)
+      clearTimeout(timeoutId)
+
+      const finalAssistantText = result.assistantText
+      const now = Date.now()
+      const hasToolCalls = result.toolCalls.length > 0
+
+      if (finalAssistantText.trim() || !hasToolCalls) {
+        updateChatMessageInStore(assistantMessage.id, {
+          text: finalAssistantText,
+          status: 'done',
+          responseId: result.responseId,
+          updatedAt: now,
+        }, 'immediate')
+      } else {
+        removeChatMessageFromStore(assistantMessage.id)
+      }
+
+      if (!hasToolCalls) {
+        updateChatSessionInStore(sessionId, { status: 'idle', updatedAt: now, lastMessageAt: now })
+        return
+      }
+
+      for (const toolCall of result.toolCalls) {
+        const toolCallMessage = createChatMessageRecord(sessionId, 'assistant', 'tool_call', '调用 generate_image', 'done')
+        toolCallMessage.toolName = toolCall.name
+        toolCallMessage.toolArgsJson = toolCall.argumentsText
+        upsertChatMessageInStore(toolCallMessage, 'immediate')
+
+        const toolResultMessage = createChatMessageRecord(sessionId, 'tool', 'image_result', '图片生成中…', 'streaming')
+        toolResultMessage.toolName = toolCall.name
+        toolResultMessage.toolArgsJson = toolCall.argumentsText
+        upsertChatMessageInStore(toolResultMessage, 'immediate')
+        updateChatSessionInStore(sessionId, { status: 'tool_running', updatedAt: Date.now(), lastMessageAt: Date.now() })
+
+        await executeGenerateImageTool(session, {
+          message: toolCallMessage,
+          resultMessage: toolResultMessage,
+          args: toolCall.arguments,
+        })
+      }
+    } catch (err) {
+      clearChatAbortController(sessionId)
+      clearTimeout(timeoutId)
+      const now = Date.now()
+      if (timedOut) {
+        updateChatMessageInStore(assistantMessage.id, (message) => ({
+          ...message,
+          status: 'error',
+          text: message.text || createOpenAITimeoutError(profile.timeout),
+          updatedAt: now,
+        }), 'immediate')
+        updateChatSessionInStore(sessionId, { status: 'error', updatedAt: now, lastMessageAt: now })
+        useStore.getState().showToast('Chat 请求超时', 'error')
+        return
+      }
+      if (typeof DOMException !== 'undefined' && err instanceof DOMException && err.name === 'AbortError') {
+        updateChatMessageInStore(assistantMessage.id, (message) => ({
+          ...message,
+          status: 'stopped',
+          text: message.text || '已停止生成',
+          updatedAt: now,
+        }), 'immediate')
+        updateChatSessionInStore(sessionId, { status: 'idle', updatedAt: now, lastMessageAt: now })
+        return
+      }
+
+      updateChatMessageInStore(assistantMessage.id, (message) => ({
+        ...message,
+        status: 'error',
+        text: message.text || (err instanceof Error ? err.message : String(err)),
+        updatedAt: now,
+      }), 'immediate')
+      updateChatSessionInStore(sessionId, { status: 'error', updatedAt: now, lastMessageAt: now })
+      useStore.getState().showToast(err instanceof Error ? err.message : String(err), 'error')
+      return
+    }
+  }
+
+  const now = Date.now()
+  updateChatSessionInStore(sessionId, { status: 'error', updatedAt: now, lastMessageAt: now })
+  useStore.getState().showToast('Chat 工具调用次数过多，已停止本轮生成', 'error')
+}
+
+export async function createChatSession() {
+  const state = useStore.getState()
+  const activeProfile = getActiveApiProfile(state.settings)
+  const session = createChatSessionRecord(activeProfile)
+  upsertChatSessionInStore(session)
+  state.setActiveChatSessionId(session.id)
+  return session
+}
+
+export async function deleteChatSession(sessionId: string) {
+  const state = useStore.getState()
+  const nextSessions = state.chatSessions.filter((session) => session.id !== sessionId)
+  const removedMessages = state.chatMessages.filter((message) => message.sessionId === sessionId)
+  const nextMessages = state.chatMessages.filter((message) => message.sessionId !== sessionId)
+  chatAbortControllers.get(sessionId)?.abort()
+  clearChatAbortController(sessionId)
+  for (const message of removedMessages) clearChatMessagePersistTimer(message.id)
+  state.setChatSessions(nextSessions)
+  state.setChatMessages(nextMessages)
+  if (state.activeChatSessionId === sessionId) {
+    state.setActiveChatSessionId(nextSessions[0]?.id ?? null)
+  }
+  await dbDeleteChatSession(sessionId)
+}
+
+export function stopChatResponse(sessionId?: string) {
+  const targetSessionId = sessionId ?? useStore.getState().activeChatSessionId
+  if (!targetSessionId) return
+  chatAbortControllers.get(targetSessionId)?.abort()
+}
+
+export async function submitChatPrompt(text: string): Promise<boolean> {
+  const trimmed = text.trim()
+  if (!trimmed) return false
+
+  const state = useStore.getState()
+  const activeProfile = getActiveApiProfile(state.settings)
+  const profileError = validateChatProfile(activeProfile)
+  if (profileError) {
+    state.showToast(profileError, 'error')
+    state.setShowSettings(true)
+    return false
+  }
+
+  let session = state.chatSessions.find((item) => item.id === state.activeChatSessionId) ?? null
+  if (!session) {
+    session = await createChatSession()
+  } else if (session.status === 'streaming' || session.status === 'tool_running') {
+    state.showToast('当前会话仍在生成中，请稍候', 'info')
+    return false
+  }
+
+  const userMessage = createChatMessageRecord(session.id, 'user', 'text', trimmed, 'done')
+  upsertChatMessageInStore(userMessage, 'immediate')
+  upsertChatSessionInStore(updateChatSessionForNewMessage(session, userMessage, 'streaming'))
+  useStore.getState().setActiveChatSessionId(session.id)
+
+  void runChatAssistantLoop(session.id)
+  return true
 }
 
 /** 复用配置 */
@@ -1372,7 +1909,7 @@ export async function editOutputs(task: TaskRecord) {
 
 /** 删除多条任务 */
 export async function removeMultipleTasks(taskIds: string[]) {
-  const { tasks, setTasks, inputImages, showToast, clearSelection, selectedTaskIds } = useStore.getState()
+  const { tasks, setTasks, inputImages, chatMessages, showToast, clearSelection, selectedTaskIds } = useStore.getState()
   
   if (!taskIds.length) return
 
@@ -1402,6 +1939,9 @@ export async function removeMultipleTasks(taskIds: string[]) {
     for (const id of t.outputImages || []) stillUsed.add(id)
   }
   for (const img of inputImages) stillUsed.add(img.id)
+  for (const message of chatMessages) {
+    for (const id of message.relatedImageIds || []) stillUsed.add(id)
+  }
 
   // 删除孤立图片
   for (const imgId of deletedImageIds) {
@@ -1423,7 +1963,7 @@ export async function removeMultipleTasks(taskIds: string[]) {
 
 /** 删除单条任务 */
 export async function removeTask(task: TaskRecord) {
-  const { tasks, setTasks, inputImages, showToast } = useStore.getState()
+  const { tasks, setTasks, inputImages, chatMessages, showToast } = useStore.getState()
 
   // 收集此任务关联的图片
   const taskImageIds = new Set([
@@ -1445,6 +1985,9 @@ export async function removeTask(task: TaskRecord) {
     for (const id of t.outputImages || []) stillUsed.add(id)
   }
   for (const img of inputImages) stillUsed.add(img.id)
+  for (const message of chatMessages) {
+    for (const id of message.relatedImageIds || []) stillUsed.add(id)
+  }
 
   // 删除孤立图片
   for (const imgId of taskImageIds) {
@@ -1466,15 +2009,32 @@ export interface ClearOptions {
 
 /** 清空数据 */
 export async function clearData(options: ClearOptions = { clearConfig: true, clearTasks: true }) {
-  const { setTasks, clearInputImages, clearMaskDraft, setSettings, setParams, showToast } = useStore.getState()
+  const { setTasks, setChatSessions, setChatMessages, setActiveChatSessionId, clearInputImages, clearMaskDraft, setSettings, setParams, showToast } = useStore.getState()
 
   if (options.clearTasks) {
-    await dbClearTasks()
-    await clearImages()
+    await Promise.all([
+      dbClearTasks(),
+      clearImages(),
+      clearChatSessions(),
+      clearChatMessages(),
+    ])
     imageCache.clear()
     thumbnailCache.clear()
     thumbnailBackfillIds.clear()
+    openAIWatchdogTimers.forEach((timer) => clearTimeout(timer))
+    openAIWatchdogTimers.clear()
+    falRecoveryTimers.forEach((timer) => clearTimeout(timer))
+    falRecoveryTimers.clear()
+    customRecoveryTimers.forEach((timer) => clearTimeout(timer))
+    customRecoveryTimers.clear()
+    chatAbortControllers.forEach((controller) => controller.abort())
+    chatAbortControllers.clear()
+    chatMessagePersistTimers.forEach((timer) => clearTimeout(timer))
+    chatMessagePersistTimers.clear()
     setTasks([])
+    setChatSessions([])
+    setChatMessages([])
+    setActiveChatSessionId(null)
     clearInputImages()
     clearMaskDraft()
   }
@@ -1577,8 +2137,9 @@ export interface ExportOptions {
 /** 导出数据为 ZIP */
 export async function exportData(options: ExportOptions = { exportConfig: true, exportTasks: true }) {
   try {
-    const tasks = options.exportTasks ? await getAllTasks() : []
-    const images = options.exportTasks ? await getAllImages() : []
+    const [tasks, images, chatSessions, chatMessages] = options.exportTasks
+      ? await Promise.all([getAllTasks(), getAllImages(), getAllChatSessions(), getAllChatMessages()])
+      : [[], [], [], []]
     const { settings } = useStore.getState()
     const exportedAt = Date.now()
     const imageCreatedAtFallback = new Map<string, number>()
@@ -1640,13 +2201,15 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
     }
 
     const manifest: ExportData = {
-      version: 3,
+      version: 4,
       exportedAt: new Date(exportedAt).toISOString(),
     }
 
     if (options.exportConfig) manifest.settings = settings
     if (options.exportTasks) {
       manifest.tasks = tasks
+      manifest.chatSessions = chatSessions
+      manifest.chatMessages = chatMessages
       manifest.imageFiles = imageFiles
       manifest.thumbnailFiles = thumbnailFiles
     }
@@ -1690,7 +2253,7 @@ export async function importData(file: File, options: ImportOptions = { importCo
     const data: ExportData = JSON.parse(strFromU8(manifestBytes))
 
     const importedImageIds: string[] = []
-    if (options.importTasks && data.tasks && data.imageFiles) {
+    if (options.importTasks && data.imageFiles) {
       // 还原图片
       for (const [id, info] of Object.entries(data.imageFiles)) {
         const bytes = unzipped[info.path]
@@ -1727,12 +2290,27 @@ export async function importData(file: File, options: ImportOptions = { importCo
         })
       }
 
-      for (const task of data.tasks) {
+      for (const task of data.tasks ?? []) {
         await putTask(task)
       }
+      for (const session of data.chatSessions ?? []) {
+        await putChatSession(session)
+      }
+      for (const message of data.chatMessages ?? []) {
+        await putChatMessage(message)
+      }
 
-      const tasks = await getAllTasks()
+      const [tasks, chatSessions, chatMessages] = await Promise.all([
+        getAllTasks(),
+        getAllChatSessions(),
+        getAllChatMessages(),
+      ])
       useStore.getState().setTasks(tasks)
+      useStore.getState().setChatSessions(chatSessions)
+      useStore.getState().setChatMessages(chatMessages)
+      if (!useStore.getState().activeChatSessionId && chatSessions[0]) {
+        useStore.getState().setActiveChatSessionId(chatSessions[0].id)
+      }
       scheduleThumbnailBackfill(importedImageIds)
     }
 

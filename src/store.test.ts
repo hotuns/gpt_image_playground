@@ -11,6 +11,7 @@ function task(overrides: Partial<TaskRecord> = {}): TaskRecord {
     id: 'task-a',
     prompt: 'prompt',
     params: { ...DEFAULT_PARAMS },
+    origin: 'manual',
     inputImageIds: [],
     maskTargetImageId: null,
     maskImageId: null,
@@ -140,6 +141,14 @@ describe('input persistence setting', () => {
 
     expect(persisted.prompt).toBe('')
     expect(persisted.inputImages).toEqual([])
+  })
+
+  it('persists workspace mode inside settings', () => {
+    useStore.setState({ settings: { ...DEFAULT_SETTINGS, workspaceMode: 'chat' } })
+
+    const persisted = getPersistedState(useStore.getState())
+
+    expect(persisted.settings.workspaceMode).toBe('chat')
   })
 })
 

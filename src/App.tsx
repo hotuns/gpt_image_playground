@@ -7,6 +7,7 @@ import Header from './components/Header'
 import SearchBar from './components/SearchBar'
 import TaskGrid from './components/TaskGrid'
 import InputBar from './components/InputBar'
+import ChatWorkspace from './components/ChatWorkspace'
 import DetailModal from './components/DetailModal'
 import Lightbox from './components/Lightbox'
 import SettingsModal from './components/SettingsModal'
@@ -17,6 +18,7 @@ import ImageContextMenu from './components/ImageContextMenu'
 
 export default function App() {
   const setSettings = useStore((s) => s.setSettings)
+  const workspaceMode = useStore((s) => s.settings.workspaceMode)
   useDockerApiUrlMigrationNotice()
 
   useEffect(() => {
@@ -50,13 +52,19 @@ export default function App() {
   return (
     <>
       <Header />
-      <main data-home-main data-drag-select-surface className="pb-48">
-        <div className="safe-area-x max-w-7xl mx-auto">
-          <SearchBar />
-          <TaskGrid />
-        </div>
-      </main>
-      <InputBar />
+      {workspaceMode === 'chat' ? (
+        <ChatWorkspace />
+      ) : (
+        <>
+          <main data-home-main data-drag-select-surface className="pb-48">
+            <div className="safe-area-x max-w-7xl mx-auto">
+              <SearchBar />
+              <TaskGrid />
+            </div>
+          </main>
+          <InputBar />
+        </>
+      )}
       <DetailModal />
       <Lightbox />
       <SettingsModal />

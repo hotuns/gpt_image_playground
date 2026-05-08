@@ -214,6 +214,11 @@ export default function TaskCard({
         onTouchEnd={handleTouchEnd}
         onTouchCancel={handleTouchCancel}
       >
+      {task.origin === 'chat-tool' && (
+        <div className="absolute left-2 top-2 z-10 rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-white shadow-sm">
+          Chat
+        </div>
+      )}
         {/* 选中时的角标 */}
       {isSelected && (
         <div className="absolute top-2 right-2 z-10 w-5 h-5 bg-blue-500 rounded-full flex items-center justify-center shadow-sm">

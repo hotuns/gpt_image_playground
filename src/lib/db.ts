@@ -1,10 +1,13 @@
-import type { TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import type { ChatMessage, ChatSession, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
 
 const DB_NAME = 'gpt-image-playground'
-const DB_VERSION = 2
+const DB_VERSION = 3
 const STORE_TASKS = 'tasks'
 const STORE_IMAGES = 'images'
 const STORE_THUMBNAILS = 'thumbnails'
+const STORE_CHAT_SESSIONS = 'chat_sessions'
+const STORE_CHAT_MESSAGES = 'chat_messages'
+const INDEX_CHAT_MESSAGES_BY_SESSION_CREATED_AT = 'bySessionCreatedAt'
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 0.9
 const THUMBNAIL_VERSION = 2
@@ -24,6 +27,18 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_THUMBNAILS)) {
         db.createObjectStore(STORE_THUMBNAILS, { keyPath: 'id' })
+      }
+      if (!db.objectStoreNames.contains(STORE_CHAT_SESSIONS)) {
+        db.createObjectStore(STORE_CHAT_SESSIONS, { keyPath: 'id' })
+      }
+      if (!db.objectStoreNames.contains(STORE_CHAT_MESSAGES)) {
+        const chatMessages = db.createObjectStore(STORE_CHAT_MESSAGES, { keyPath: 'id' })
+        chatMessages.createIndex(INDEX_CHAT_MESSAGES_BY_SESSION_CREATED_AT, ['sessionId', 'createdAt'], { unique: false })
+      } else {
+        const chatMessages = req.transaction?.objectStore(STORE_CHAT_MESSAGES)
+        if (chatMessages && !chatMessages.indexNames.contains(INDEX_CHAT_MESSAGES_BY_SESSION_CREATED_AT)) {
+          chatMessages.createIndex(INDEX_CHAT_MESSAGES_BY_SESSION_CREATED_AT, ['sessionId', 'createdAt'], { unique: false })
+        }
       }
     }
     req.onsuccess = () => resolve(req.result)
@@ -64,6 +79,99 @@ export function deleteTask(id: string): Promise<undefined> {
 
 export function clearTasks(): Promise<undefined> {
   return dbTransaction(STORE_TASKS, 'readwrite', (s) => s.clear())
+}
+
+// ===== Chat =====
+
+export function getAllChatSessions(): Promise<ChatSession[]> {
+  return dbTransaction(STORE_CHAT_SESSIONS, 'readonly', (s) => s.getAll())
+}
+
+export function putChatSession(session: ChatSession): Promise<IDBValidKey> {
+  return dbTransaction(STORE_CHAT_SESSIONS, 'readwrite', (s) => s.put(session))
+}
+
+export function deleteChatSessionRecord(id: string): Promise<undefined> {
+  return dbTransaction(STORE_CHAT_SESSIONS, 'readwrite', (s) => s.delete(id))
+}
+
+export function clearChatSessions(): Promise<undefined> {
+  return dbTransaction(STORE_CHAT_SESSIONS, 'readwrite', (s) => s.clear())
+}
+
+export function getAllChatMessages(): Promise<ChatMessage[]> {
+  return dbTransaction(STORE_CHAT_MESSAGES, 'readonly', (s) => s.getAll())
+}
+
+export function putChatMessage(message: ChatMessage): Promise<IDBValidKey> {
+  return dbTransaction(STORE_CHAT_MESSAGES, 'readwrite', (s) => s.put(message))
+}
+
+export function deleteChatMessage(id: string): Promise<undefined> {
+  return dbTransaction(STORE_CHAT_MESSAGES, 'readwrite', (s) => s.delete(id))
+}
+
+export function clearChatMessages(): Promise<undefined> {
+  return dbTransaction(STORE_CHAT_MESSAGES, 'readwrite', (s) => s.clear())
+}
+
+export function getChatMessagesBySession(sessionId: string): Promise<ChatMessage[]> {
+  return openDB().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_CHAT_MESSAGES, 'readonly')
+        const store = tx.objectStore(STORE_CHAT_MESSAGES)
+        const index = store.index(INDEX_CHAT_MESSAGES_BY_SESSION_CREATED_AT)
+        const req = index.getAll(IDBKeyRange.bound([sessionId, 0], [sessionId, Number.MAX_SAFE_INTEGER]))
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
+      }),
+  )
+}
+
+export function deleteChatMessagesBySession(sessionId: string): Promise<void> {
+  return openDB().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_CHAT_MESSAGES, 'readwrite')
+        const store = tx.objectStore(STORE_CHAT_MESSAGES)
+        const index = store.index(INDEX_CHAT_MESSAGES_BY_SESSION_CREATED_AT)
+        const range = IDBKeyRange.bound([sessionId, 0], [sessionId, Number.MAX_SAFE_INTEGER])
+        const req = index.openCursor(range)
+        req.onsuccess = () => {
+          const cursor = req.result
+          if (!cursor) return
+          cursor.delete()
+          cursor.continue()
+        }
+        req.onerror = () => reject(req.error)
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+      }),
+  )
+}
+
+export function deleteChatSession(id: string): Promise<void> {
+  return openDB().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction([STORE_CHAT_SESSIONS, STORE_CHAT_MESSAGES], 'readwrite')
+        tx.objectStore(STORE_CHAT_SESSIONS).delete(id)
+        const messageStore = tx.objectStore(STORE_CHAT_MESSAGES)
+        const index = messageStore.index(INDEX_CHAT_MESSAGES_BY_SESSION_CREATED_AT)
+        const range = IDBKeyRange.bound([id, 0], [id, Number.MAX_SAFE_INTEGER])
+        const req = index.openCursor(range)
+        req.onsuccess = () => {
+          const cursor = req.result
+          if (!cursor) return
+          cursor.delete()
+          cursor.continue()
+        }
+        req.onerror = () => reject(req.error)
+        tx.oncomplete = () => resolve()
+        tx.onerror = () => reject(tx.error)
+      }),
+  )
 }
 
 // ===== Images =====

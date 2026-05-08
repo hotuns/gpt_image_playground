@@ -4,6 +4,7 @@ import {
   DEFAULT_FAL_MODEL,
   DEFAULT_IMAGES_MODEL,
   DEFAULT_OPENAI_PROFILE_ID,
+  DEFAULT_RESPONSES_MODEL,
   DEFAULT_SETTINGS,
   createDefaultFalProfile,
   findEquivalentApiProfile,
@@ -14,7 +15,68 @@ import {
   switchApiProfileProvider,
 } from './apiProfiles'
 
+describe('normalizeSettings', () => {
+  it('defaults chat model and workspace mode for the default profile', () => {
+    const normalized = normalizeSettings({})
+
+    expect(normalized.workspaceMode).toBe('image')
+    expect(normalized.profiles[0]).toMatchObject({
+      provider: 'openai',
+      model: DEFAULT_IMAGES_MODEL,
+      chatModel: DEFAULT_RESPONSES_MODEL,
+    })
+  })
+
+  it('preserves imported chat model and workspace mode', () => {
+    const normalized = normalizeSettings({
+      workspaceMode: 'chat',
+      profiles: [{
+        id: 'openai-chat',
+        name: 'OpenAI Chat',
+        provider: 'openai',
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'key',
+        model: 'gpt-image-2',
+        chatModel: 'gpt-5.5',
+        timeout: 300,
+        apiMode: 'images',
+        codexCli: false,
+        apiProxy: false,
+      }],
+      activeProfileId: 'openai-chat',
+    })
+
+    expect(normalized.workspaceMode).toBe('chat')
+    expect(normalized.profiles[0].chatModel).toBe('gpt-5.5')
+  })
+})
+
 describe('mergeImportedSettings', () => {
+  it('keeps imported workspace mode when replacing untouched default settings', () => {
+    const merged = mergeImportedSettings(DEFAULT_SETTINGS, {
+      workspaceMode: 'chat',
+      profiles: [
+        {
+          id: 'imported-openai',
+          name: 'Imported OpenAI',
+          provider: 'openai',
+          baseUrl: 'https://api.example.com/v1',
+          apiKey: 'openai-key',
+          model: DEFAULT_IMAGES_MODEL,
+          chatModel: DEFAULT_RESPONSES_MODEL,
+          timeout: 300,
+          apiMode: 'images',
+          codexCli: false,
+          apiProxy: false,
+        },
+      ],
+      activeProfileId: 'imported-openai',
+    })
+
+    expect(merged.workspaceMode).toBe('chat')
+    expect(merged.activeProfileId).toBe('imported-openai')
+  })
+
   it('replaces the default OpenAI profile with legacy imported settings when current settings are untouched', () => {
     const merged = mergeImportedSettings(DEFAULT_SETTINGS, {
       baseUrl: 'https://api.example.com/v1',

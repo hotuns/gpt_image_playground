@@ -5,6 +5,8 @@ import HelpModal from './HelpModal'
 
 export default function Header() {
   const setShowSettings = useStore((s) => s.setShowSettings)
+  const workspaceMode = useStore((s) => s.settings.workspaceMode)
+  const setSettings = useStore((s) => s.setSettings)
   const { hasUpdate, latestRelease, dismiss } = useVersionCheck()
   const [showHelp, setShowHelp] = useState(false)
 
@@ -12,7 +14,7 @@ export default function Header() {
     <>
       <header data-no-drag-select className="safe-area-top fixed top-0 left-0 right-0 z-40 bg-white/80 dark:bg-gray-950/80 backdrop-blur border-b border-gray-200 dark:border-white/[0.08]">
         <div className="safe-area-x safe-header-inner max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-start gap-1">
+          <div className="flex items-center gap-3">
             <h1 className="text-lg font-bold tracking-tight">
               <a
                 href="https://github.com/CookSleep/gpt_image_playground"
@@ -20,7 +22,7 @@ export default function Header() {
                 rel="noopener noreferrer"
                 className="text-gray-800 dark:text-gray-100 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
               >
-                GPT Image Playground
+                GPT Playground
               </a>
             </h1>
             {hasUpdate && latestRelease && (
@@ -35,8 +37,33 @@ export default function Header() {
                 NEW
               </a>
             )}
+            <div className="hidden rounded-2xl border border-gray-200 bg-gray-100/80 p-1 sm:flex dark:border-white/[0.08] dark:bg-white/[0.04]">
+              <button
+                type="button"
+                onClick={() => setSettings({ workspaceMode: 'image' })}
+                className={`rounded-xl px-3 py-1.5 text-sm transition ${workspaceMode === 'image' ? 'bg-white text-gray-900 shadow-sm dark:bg-white dark:text-gray-900' : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100'}`}
+              >
+                图片
+              </button>
+              <button
+                type="button"
+                onClick={() => setSettings({ workspaceMode: 'chat' })}
+                className={`rounded-xl px-3 py-1.5 text-sm transition ${workspaceMode === 'chat' ? 'bg-white text-gray-900 shadow-sm dark:bg-white dark:text-gray-900' : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100'}`}
+              >
+                Chat
+              </button>
+            </div>
           </div>
           <div className="flex items-center gap-1">
+            <div className="mr-1 rounded-2xl border border-gray-200 bg-gray-100/80 p-1 sm:hidden dark:border-white/[0.08] dark:bg-white/[0.04]">
+              <button
+                type="button"
+                onClick={() => setSettings({ workspaceMode: workspaceMode === 'image' ? 'chat' : 'image' })}
+                className="rounded-xl px-2.5 py-1 text-xs text-gray-700 dark:text-gray-200"
+              >
+                {workspaceMode === 'image' ? 'Chat' : '图片'}
+              </button>
+            </div>
             <button
               onClick={() => setShowHelp(true)}
               className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-900 transition-colors"

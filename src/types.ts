@@ -1,6 +1,7 @@
 // ===== 设置 =====
 
 export type ApiMode = 'images' | 'responses'
+export type WorkspaceMode = 'image' | 'chat'
 export type BuiltInApiProvider = 'openai' | 'fal'
 export type ApiProvider = BuiltInApiProvider | string
 export type CustomProviderTemplate = 'http-image'
@@ -59,6 +60,7 @@ export interface ApiProfile {
   baseUrl: string
   apiKey: string
   model: string
+  chatModel: string
   timeout: number
   apiMode: ApiMode
   codexCli: boolean
@@ -79,6 +81,7 @@ export interface AppSettings {
   persistInputOnRestart: boolean
   reuseTaskApiProfileTemporarily: boolean
   alwaysShowRetryButton: boolean
+  workspaceMode: WorkspaceMode
   profiles: ApiProfile[]
   activeProfileId: string
 }
@@ -126,6 +129,10 @@ export interface TaskRecord {
   id: string
   prompt: string
   params: TaskParams
+  /** 任务来源：手动提交 / Chat 工具调用 */
+  origin: 'manual' | 'chat-tool'
+  chatSessionId?: string
+  chatMessageId?: string
   /** 生成时使用的 Provider 类型 */
   apiProvider?: ApiProvider
   /** 生成时使用的 API 配置 ID */
@@ -164,6 +171,39 @@ export interface TaskRecord {
   elapsed: number | null
   /** 是否收藏 */
   isFavorite?: boolean
+}
+
+// ===== Chat 会话 =====
+
+export type ChatSessionStatus = 'idle' | 'streaming' | 'tool_running' | 'error'
+export type ChatMessageRole = 'user' | 'assistant' | 'tool'
+export type ChatMessageKind = 'text' | 'tool_call' | 'image_result'
+export type ChatMessageStatus = 'streaming' | 'done' | 'stopped' | 'error'
+
+export interface ChatSession {
+  id: string
+  title: string
+  apiProfileId: string
+  status: ChatSessionStatus
+  createdAt: number
+  updatedAt: number
+  lastMessageAt: number
+}
+
+export interface ChatMessage {
+  id: string
+  sessionId: string
+  role: ChatMessageRole
+  kind: ChatMessageKind
+  text: string
+  status: ChatMessageStatus
+  responseId?: string
+  toolName?: string
+  toolArgsJson?: string
+  relatedTaskId?: string
+  relatedImageIds?: string[]
+  createdAt: number
+  updatedAt: number
 }
 
 // ===== IndexedDB 存储的图片 =====
@@ -283,6 +323,8 @@ export interface ExportData {
   exportedAt: string
   settings?: AppSettings
   tasks?: TaskRecord[]
+  chatSessions?: ChatSession[]
+  chatMessages?: ChatMessage[]
   /** imageId → 图片信息 */
   imageFiles?: Record<string, {
     path: string
